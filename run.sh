@@ -30,7 +30,7 @@ for input_path in "$input_dir"/*; do
     fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$input_path" 2>/dev/null)
     gop=$(echo "$fps" | awk -F/ '{d = ($2 == "" ? 1 : $2); g = int(2 * $1 / d); print (g < 1 ? 1 : g)}')
     ffmpeg -v error -nostdin -y -threads 1 -i "$input_path" -map 0:v:0 -an -sn -dn -fps_mode passthrough \
-        -c:v libsvtav1 -pix_fmt yuv420p10le -preset 12 -g "$gop" -svtav1-params "scd=0:irefresh-type=2:lp=1:crf=63" \
+        -c:v libsvtav1 -pix_fmt yuv420p10le -preset 12 -g "$gop" -svtav1-params "scd=0:irefresh-type=2:lp=1:crf=63:tune=1:film-grain=0:enable-qm=1:qm-min=0" \
         -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv -map_metadata -1 -write_tmcd 0 \
         -f mp4 "$output_dir/.fallback-$name" \
         && mv "$output_dir/.fallback-$name" "$output_dir/$name" && echo "fallback: $name" >&2

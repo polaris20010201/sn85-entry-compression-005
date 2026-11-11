@@ -45,7 +45,13 @@ from fractions import Fraction
 # the competition manifest's streaming_rules (sn85-compression-005)
 BPP, KEYINT_S, PEAK_RATIO, PEAK_WINDOW_S = 0.05, 2.0, 1.5, 2.0
 # encoder and rate control (tuned on practice-pack-005, which is CC0)
-PRESET, PROBE_PRESET, SVT_EXTRA = 6, 12, "enable-qm=1:qm-min=0"
+PRESET, PROBE_PRESET = 6, 12
+SVT_BASE = "tune=1:film-grain=0"
+SVT_EXTRA = "enable-qm=1:qm-min=0"
+# SVT-AV1 4.2 bug: quantization matrices at CRF <= ~5 on a full 2 s segment of screen content corrupt the
+# picture (practice-pack q05/q06: 20 dB instead of 47 dB). The matrices only help at high CRF (AI clips at ~56), so
+# segments below QM_MIN_CRF are encoded without them.
+QM_MIN_CRF = 8.0
 # The validator allows an average of budget x 1.01 and a 2 s peak of budget x 1.5. measure() reads the same packets
 # the same way (official scores matched it to 3 decimals), so half of the 1 % slack is kept as margin.
 AIM, DONE, MAX_PASSES = 0.99, 0.95, 3
@@ -61,6 +67,18 @@ CAPPED_SEG_FRAMES = int(os.environ.get("ENTRY_CAPPED_SEG_FRAMES", "60"))
 AVG_OK, PEAK_OK, PEAK_AIM = 1.005, 0.99 * PEAK_RATIO, 0.96 * PEAK_RATIO
 CRF_MIN, CRF_MAX = 1.0, 63.0
 SOFT_SECONDS = float(os.environ.get("ENTRY_SOFT_SECONDS", "150"))
+# Hopeless items (practice-pack q08: wind-blown wheat, AI): no setting reaches VMAF 60, below which an item scores 0
+# (preset 2 tops out at 59.9). Only high-CRF items are checked: the second probe (preset 12, near the budget) gets a
+# quick VMAF over its first segment (every frame: subsampling breaks VMAF's motion feature, q08 read 65.8 instead of
+# 55.6). Below HOPELESS_VMAF, the probe file is kept, with no main search and no polish. Calibration at preset 12 near
+# the budget: q08 ~48, q07 ~67. The largest preset-12 to preset-2 gain measured is ~+12, so an item below the cut
+# cannot reach 60.
+HOPELESS_CRF, HOPELESS_VMAF = 50.0, float(os.environ.get("ENTRY_HOPELESS_VMAF", "50"))
+# the verdict needs a probe that fills at least this share of the budget (a starved probe at CRF 63 says nothing:
+# extra-005 e07 read VMAF 26 at 43 % of the budget)
+HOPELESS_MIN_FILL = 0.8
+# extra main-preset passes allowed while no main-preset file has passed the rules yet, or it fills < 85 %
+RESCUE_PASSES = 3
 # leftover time: run.sh time up to frames x KNEE_SPF earns the full speed score (speed_fast_spf = 1/30 s per
 # frame), so time left there is spent re-encoding the hardest items at slower presets. Measured with the
 # lp=1 segment encoder: time relative to preset 6.
@@ -111,6 +129,16 @@ def probe(path: str) -> tuple[int, int, Fraction, int]:
     return int(s["width"]), int(s["height"]), Fraction(s["r_frame_rate"]), int(s["nb_read_packets"])
 
 
+def quick_vmaf(candidate: str, source: str, log_path: pathlib.Path, frames: int) -> float:
+    """vmaf_v0.6.1 (built into the ffmpeg build) over the first `frames` frames, every frame, paired by index."""
+    align = f"trim=end_frame={frames},format=yuv420p,settb=1,setpts=N"
+    run(["ffmpeg", "-v", "error", "-nostdin", "-threads", "2", "-i", candidate, "-threads", "2", "-i", source,
+         "-lavfi", f"[0:v:0]{align}[d];[1:v:0]{align}[r];[d][r]libvmaf=model=version=vmaf_v0.6.1:n_threads=4:"
+                   f"pool=mean:log_fmt=json:log_path={log_path}",
+         "-f", "null", "-"], timeout=600)
+    return float(json.loads(log_path.read_text())["pooled_metrics"]["vmaf"]["mean"])
+
+
 def measure(path: str, fps: float, frames: int) -> tuple[float, float, float, bool, int, bool]:
     """avg kbps, peak kbps, longest keyframe gap, first-is-key, packets (as vidaio/scoring/streaming.py), and
     whether every frame sits within half a frame of its slot on the constant-rate grid (the validator's CFR
@@ -144,7 +172,9 @@ def encode_segment(src: str, start: int, count: int, rate: Fraction, gop: int, c
     run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-threads", "1", *ss, "-i", src, "-frames:v", str(count),
          "-map", "0:v:0", "-an", "-sn", "-dn", "-filter_threads", "1", "-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le",
          "-preset", str(preset), "-g", str(gop),
-         "-svtav1-params", f"scd=0:irefresh-type=2:lp={LP}:crf={crf:.2f}:{SVT_EXTRA}", *TAGS,
+         "-svtav1-params", f"scd=0:irefresh-type=2:lp={LP}:crf={crf:.2f}:{SVT_BASE}"
+         + (f":{SVT_EXTRA}" if crf >= QM_MIN_CRF else ":enable-qm=0"),
+         *TAGS,
          "-video_track_timescale", str(rate.numerator), *MP4, dst])
     return pathlib.Path(dst).stat().st_size
 
@@ -190,6 +220,7 @@ class Item:
         self.passes = 0
         self.p6_secs = 0.0  # wall time of the latest main-preset pass (the leftover-time estimate)
         self.slopes: list[float] = []  # per segment d ln(size) / d CRF at the main preset
+        self.hopeless = False  # cannot reach VMAF 60: keep the cheap probe file, no further passes
 
     def encode_pass(self, crfs: list[float], preset: int, polish: bool = False) -> tuple[list[int], dict]:
         self.passes += 1
@@ -239,14 +270,17 @@ class Item:
         sizes, _ = self.encode_pass([c_probe] * n, PROBE_PRESET)
         for pts, sz in zip(probe_pts, sizes):
             pts.append((c_probe, sz))
-        passes, bump, prev = [], [0.0] * n, None
+        if c_probe >= HOPELESS_CRF and self.check_hopeless(probe_pts):
+            return
+        passes, floor, prev = [], [CRF_MIN] * n, None
         max_passes, done = (MAX_PASSES, DONE) if LP > 1 else (CAPPED_MAX_PASSES, CAPPED_DONE)
-        for it in range(max_passes + 1):
+        for it in range(max_passes + RESCUE_PASSES):
             if time.monotonic() - START > SOFT_SECONDS:
                 log(f"{self.name[:12]}: time is up, keeping what passed")
                 break
-            if it == max_passes and (self.kept is None or not self.kept["target"] or self.kept["avg"] >= 0.85):
-                break  # one extra pass only when the kept file still wastes over 15 % of the budget
+            short = self.kept is None or not self.kept["target"] or self.kept["avg"] < 0.85
+            if it >= max_passes and not short:
+                break  # extra (rescue) passes only while no main-preset file passed or it wastes over 15 % of the budget
             if not passes:
                 # first target pass: probe fit, never far from the probes (size(CRF) bends at low CRF)
                 crfs = [min(max(c, c_probe - 4), c_probe + 4)
@@ -265,7 +299,7 @@ class Item:
                     models.append(secant(pts, secant(pp, -0.08)[1]))
                 crfs = [min(max(c, lc - 6), lc + 6)
                         for c, lc in zip(solve(models, self.total_cap, self.seg_caps), last_crfs)]
-            crfs = [min(CRF_MAX, c + b) for c, b in zip(crfs, bump)]
+            crfs = [min(CRF_MAX, max(c, f)) for c, f in zip(crfs, floor)]
             if prev and max(abs(x - y) for x, y in zip(crfs, prev)) < 0.05:
                 break
             sizes, rec = self.encode_pass(crfs, PRESET)
@@ -274,10 +308,13 @@ class Item:
             if self.kept and self.kept["target"] and self.kept["avg"] >= done:
                 break
             if not rec["ok"] and rec["avg"] <= AVG_OK and rec["peak"] > PEAK_OK:
+                # the window that peaked: from now on its two segments stay above their last CRF by the measured excess
+                # (as a floor, so the common-CRF solve cannot undo it by lowering every segment)
                 pair = max(range(n), key=lambda i: sizes[i] + (sizes[i + 1] if i + 1 < n else 0))
+                step = max(1.0, math.log(rec["peak"] / (PEAK_OK * 0.97)) / 0.08)
                 for i in (pair, pair + 1):
                     if i < n:
-                        bump[i] += 1.0
+                        floor[i] = min(CRF_MAX, crfs[i] + step)
         self.slopes = [secant([(q[0][i], q[1][i]) for q in passes], secant(probe_pts[i], -0.08)[1])[1]
                        for i in range(n)] if passes else []
 
@@ -312,6 +349,24 @@ class Item:
                 lo, hi = (lo, mid) if sum(sz * math.exp(b * mid) for sz, b in zip(sizes, self.slopes)) <= want else (mid, hi)
             crfs = [min(CRF_MAX, max(CRF_MIN, c + hi)) for c in crfs]
         return False
+
+    def check_hopeless(self, probe_pts) -> bool:
+        """Quick VMAF of a passing near-budget probe file; True (keep it, stop) when even the slowest presets could not
+        lift the item to VMAF 60."""
+        if self.kept is None:  # the second probe missed the rules: one more probe-preset pass aimed at the budget
+            crfs = solve([secant(p, -0.08) for p in probe_pts], self.total_cap, self.seg_caps)
+            self.encode_pass(crfs, PROBE_PRESET)
+        if self.kept is None or self.kept["avg"] < HOPELESS_MIN_FILL:
+            return False
+        try:
+            v = quick_vmaf(self.kept["path"], self.src, self.tmp / "hopeless-vmaf.json", self.gop)
+        except Exception as exc:  # noqa: BLE001 - no verdict: full effort
+            log(f"{self.name[:12]}: quick VMAF failed ({exc}), full search")
+            return False
+        self.hopeless = v < HOPELESS_VMAF
+        log(f"{self.name[:12]}: probe VMAF {v:.1f} at crf {sum(self.kept['crfs']) / len(self.kept['crfs']):.1f} -> "
+            f"{'hopeless, keeping the preset-12 probe' if self.hopeless else 'full search'}")
+        return self.hopeless
 
     def emergency(self) -> None:
         """Whole-clip preset-12 encodes at rising CRF until one passes the rules."""
@@ -376,7 +431,7 @@ def polish_phase(items: list[Item], finish) -> None:
         while True:
             now = time.monotonic()
             cands = sorted((it for it in items if it.kept and it.kept["target"] and it.kept["preset"] > preset
-                            and it.slopes and it.name not in tried),
+                            and it.slopes and not it.hopeless and it.name not in tried),
                            key=lambda it: -sum(it.kept["crfs"]) / len(it.kept["crfs"]))
             wave, used = [], 0
             for it in cands:
